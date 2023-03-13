@@ -30,7 +30,9 @@ DEFAULT_CLASSIFICATION_MODEL = 'bhadresh-savani/distilbert-base-uncased-emotion'
 DEFAULT_CAPTIONING_MODEL = 'Salesforce/blip-image-captioning-large'
 DEFAULT_KEYPHRASE_MODEL = 'ml6team/keyphrase-extraction-distilbert-inspec'
 DEFAULT_PROMPT_MODEL = 'FredZhang7/anime-anything-promptgen-v2'
+DEFAULT_TEXT_MODEL = 'PygmalionAI/pygmalion-6b'
 DEFAULT_SD_MODEL = "ckpt/anything-v4.5-vae-swapped"
+
 #ALL_MODULES = ['caption', 'summarize', 'classify', 'keywords', 'prompt', 'sd']
 DEFAULT_SUMMARIZE_PARAMS = {
     'temperature': 1.0,
@@ -40,7 +42,23 @@ DEFAULT_SUMMARIZE_PARAMS = {
     'length_penalty': 1.5,
     'bad_words': ["\n", '"', "*", "[", "]", "{", "}", ":", "(", ")", "<", ">", "Â"]
 }
-
+DEFAULT_TEXT_PARAMS = {
+    'do_sample': True,
+    'max_length':2048,
+    'use_cache':True,
+    'min_new_tokens':10,
+    'temperature':0.71,
+    'repetition_penalty':1.01,
+    'top_p':0.9,
+    'top_k':40,
+    'typical_p':1,
+    'repetition_penalty': 1,
+    'num_beams': 1,
+    'penalty_alpha': 0,
+    'length_penalty': 1,
+    'no_repeat_ngram_size': 0,
+    'early_stopping': False,
+}
 class SplitArgs(argparse.Action):
     def __call__(self, parser, namespace, values, option_string=None):
         setattr(namespace, self.dest, values.replace('"', '').replace("'", '').split(','))
@@ -70,6 +88,8 @@ parser.add_argument('--sd-model',
                     help="Load a custom SD image generation model")
 parser.add_argument('--sd-cpu',
                     help="Force the SD pipeline to run on the CPU")
+parser.add_argument('--text-model',
+                    help="Load a custom text generation model")
 parser.add_argument('--enable-modules', action=SplitArgs, default=[],
                     help="Override a list of enabled modules")
 
@@ -83,6 +103,7 @@ captioning_model = args.captioning_model if args.captioning_model else DEFAULT_C
 keyphrase_model = args.keyphrase_model if args.keyphrase_model else DEFAULT_KEYPHRASE_MODEL
 prompt_model = args.prompt_model if args.prompt_model else DEFAULT_PROMPT_MODEL
 sd_model = args.sd_model if args.sd_model else DEFAULT_SD_MODEL
+text_model = args.text_model if args.text_model else DEFAULT_TEXT_MODEL
 modules = args.enable_modules if args.enable_modules and len(args.enable_modules) > 0 else []
 
 if len(modules) == 0:
@@ -135,6 +156,11 @@ if 'sd' in modules:
     sd_pipe.enable_attention_slicing()
     # pipe.scheduler = KarrasVeScheduler.from_config(pipe.scheduler.config)
     sd_pipe.scheduler = EulerAncestralDiscreteScheduler.from_config(sd_pipe.scheduler.config)
+
+if 'text' in modules:
+    print('Initializing a text generator')
+    text_tokenizer = AutoTokenizer.from_pretrained(text_model)
+    text_transformer = AutoModelForCausalLM.from_pretrained(text_model, torch_dtype=torch.float16).to(device)
 
 prompt_prefix = "best quality, absurdres, "
 neg_prompt = """lowres, bad anatomy, error body, error hair, error arm,
@@ -264,6 +290,45 @@ def image_to_base64(image: Image):
     img_str = base64.b64encode(buffered.getvalue()).decode("utf-8") 
     return img_str
 
+def generate_text(prompt: str, settings: dict) -> str:
+    input_ids = text_tokenizer.encode(prompt, return_tensors="pt").to(device)
+    attention_mask = torch.ones_like(input_ids)
+    output = text_transformer.generate(
+        input_ids,
+        max_length=int(settings['max_length']),
+        do_sample=settings['do_sample'],
+        use_cache=settings['use_cache'],
+        typical_p=float(settings['typical_p']),
+        penalty_alpha=float(settings['penalty_alpha']),
+        min_new_tokens=int(settings['min_new_tokens']),
+        temperature=float(settings['temperature']),
+        length_penalty=float(settings['length_penalty']),
+        early_stopping=settings['early_stopping'],
+        repetition_penalty=float(settings['repetition_penalty']),
+        num_beams=int(settings['num_beams']),
+        top_p=float(settings['top_p']),
+        top_k=int(settings['top_k']),
+        no_repeat_ngram_size=float(settings['no_repeat_ngram_size']),
+        attention_mask=attention_mask,
+        pad_token_id=text_tokenizer.pad_token_id,
+        )
+    if output is not None:
+        generated_text = text_tokenizer.decode(output[0], skip_special_tokens=True)
+        prompt_lines  = [line.strip() for line in str(prompt).split("\n")]
+        response_lines  = [line.strip() for line in str(generated_text).split("\n")]
+        new_amt = (len(response_lines) - len(prompt_lines)) + 1
+        closest_lines = response_lines[-new_amt:]
+        last_line = prompt_lines[-1]
+        if last_line:
+            last_line_words = last_line.split()
+            if len(last_line_words) > 0:
+                filter_word = last_line_words[0]
+                closest_lines[0] = closest_lines[0].replace(filter_word, '', 1).lstrip()
+                result_text = "\n".join(closest_lines)
+        results = {"text" : result_text}
+        return results
+    else:
+        return {'text': "This is an empty message. Something went wrong. Please check your code!"}
 
 @app.before_request
 # Request time measuring
@@ -395,6 +460,7 @@ def api_prompt():
     return jsonify({'prompts': prompts})
 
 
+
 @app.route('/api/image', methods=['POST'])
 @require_module('sd')
 def api_image():
@@ -407,6 +473,21 @@ def api_image():
     base64image = image_to_base64(image)
     return jsonify({'image': base64image})
 
+@app.route('/api/text', methods=['POST'])
+@require_module('text')
+def api_text():
+    data = request.get_json()
+    if 'prompt' not in data or not isinstance(data['prompt'], str):
+        abort(400, '"prompt" is required')
+
+    settings = DEFAULT_TEXT_PARAMS.copy()
+
+    if 'settings' in data and isinstance(data['settings'], dict):
+        settings.update(data['settings'])
+    
+    prompt = data['prompt']
+    results = {'results': [generate_text(prompt, settings)]}
+    return jsonify(results)
 
 if args.share:
     from flask_cloudflared import _run_cloudflared
